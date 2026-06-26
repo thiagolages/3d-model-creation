@@ -16,13 +16,17 @@ Output: a single watertight STL ready for 3D printing.
 
 import os, sys, math
 import numpy as np
+import yaml
 import trimesh
 from trimesh.creation import cylinder, extrude_polygon
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon, Point, box
 
 # ============================================================
 # PARAMETERS - edit these to customize
 # ============================================================
+
+# --- Output naming ---
+base_name               = "coffee_sleeve_official"
 
 # --- Cylinder body ---
 inner_diameter          = 105.25
@@ -48,21 +52,36 @@ pocket1_bottom_clearance = 2.0    # gap between paper bottom and sleeve floor
 pocket2_enabled         = True
 pocket2_theta_deg       = 180.0
 pocket2_paper_width     = pocket1_paper_width # same as paper1
-pocket2_paper_height    = 36.0    # height from the top
+pocket2_frame_bottom    = 3.0
+pocket2_paper_height    = 35.0 + pocket2_frame_bottom  # height from the top
 pocket2_back_wall       = 1.2    # ≥2 FDM perimeters
 pocket2_frame_side      = 10.0
-pocket2_frame_bottom    = 2.0
 
 # --- Hole pattern on the cylinder wall ---
 pattern_shape           = "hexagon"   # hexagon | pentagon | triangle
-pattern_size            = 5.5
+pattern_size            = 10.0
 pattern_spacing         = 1.5
-pattern_margin_top      = 2.0
+pattern_margin_top      = 1.5
 pattern_margin_bottom   = 4.0
+pattern_through_pockets = True   # let the wall pattern cut through pockets 1 & 2
+
+# --- Side openings: two vertical peek windows flanking pocket 1 ---
+side_openings_enabled     = True
+side_opening_width        = 16.0   # arc-length mm, clamped to gap
+side_opening_height       = np.inf #70.0   # mm, clamped to band
+side_opening_top_clear    = 6.0    # gap from sleeve top
+side_opening_bottom_clear = 8.0    # gap from sleeve bottom
+side_opening_pocket_gap   = 2.0    # clearance from pocket 1 boss edge
+# Opening + raised bezel frame
+side_opening_shape         = "rectangular"  # rectangular | round (ellipse)
+side_opening_frame_width   = 0.0   # bezel band thickness L/R (arc), beyond opening
+side_opening_frame_height  = 0.0   # bezel band thickness top/bottom (z), beyond opening
+side_opening_frame_relief  = 0.0   # radial protrusion of the raised bezel
+side_opening_frame_fillet  = 8.0   # corner radius (rectangular only)
 
 # --- Bottom floor pattern ---
 bottom_pattern_enabled  = True
-bottom_pattern_margin   = 3.0     # mm gap between holes and inner bore wall
+bottom_pattern_margin   = 0.0     # mm gap between holes and inner bore wall
 
 # --- Base border ring (transitions floor ↔ cylindrical wall) ---
 base_border_enabled     = True
@@ -248,7 +267,8 @@ def generate_pattern_polygons():
 
 def mask_pocket_regions(polygons, circumference, pockets):
     buffer = max(pattern_spacing * 1.5, 3.0)
-    def overlaps(poly, p):
+
+    def overlaps_boss(poly, p):
         pminx, pminy, pmaxx, pmaxy = poly.bounds
         if pmaxy < p.boss_z_bottom - buffer or pminy > p.boss_z_top + buffer:
             return False
@@ -259,7 +279,32 @@ def mask_pocket_regions(polygons, circumference, pockets):
             if not (b < u_c - half or a > u_c + half):
                 return True
         return False
-    return [pg for pg in polygons if not any(overlaps(pg, p) for p in pockets)]
+
+    def inside_keep_rect(poly, p):
+        """True if the hole is fully within the pocket's interior keep-rect
+        (window area minus frame margins) — wrap-aware in u."""
+        pminx, pminy, pmaxx, pmaxy = poly.bounds
+        z_lo = p.cavity_bot_z + p.frame_bottom
+        z_hi = min(p.cavity_top_z, sleeve_height) - p.frame_bottom
+        if pminy < z_lo or pmaxy > z_hi:
+            return False
+        u_c = p.theta * R_out
+        u_half = p.paper_w / 2.0 - p.frame_side
+        if u_half <= 0:
+            return False
+        for shift in (-circumference, 0.0, circumference):
+            if (pminx + shift) >= u_c - u_half and (pmaxx + shift) <= u_c + u_half:
+                return True
+        return False
+
+    def masked(poly, p):
+        if not overlaps_boss(poly, p):
+            return False
+        if pattern_through_pockets and inside_keep_rect(poly, p):
+            return False   # keep interior holes → they cut through the pocket
+        return True
+
+    return [pg for pg in polygons if not any(masked(pg, p) for p in pockets)]
 
 
 def build_pattern_cutters(polygons, max_boss_R):
@@ -341,16 +386,164 @@ def build_base_border():
 
 
 # ----------------------------------------------------------
+# Side openings (two vertical peek windows flanking pocket 1)
+# ----------------------------------------------------------
+def _ellipse_poly(cu, cz, a, b, n=72):
+    ts = np.linspace(0, 2 * math.pi, n, endpoint=False)
+    return Polygon([(cu + a * math.cos(t), cz + b * math.sin(t)) for t in ts])
+
+
+def _rrect_poly(cu, cz, width, height, fillet, res=16):
+    f = max(0.0, min(fillet, width / 2.0 - 1e-3, height / 2.0 - 1e-3))
+    if f <= 0:
+        return box(cu - width / 2, cz - height / 2, cu + width / 2, cz + height / 2)
+    inner = box(cu - width / 2 + f, cz - height / 2 + f,
+                cu + width / 2 - f, cz + height / 2 - f)
+    return inner.buffer(f, resolution=res, join_style=1)   # round corners
+
+
+def _opening_and_frame_profiles(w, h, z_c):
+    """Opening + frame outlines in unrolled (u, z) space, centered at u=0.
+    Frame extends side_opening_frame_width/height beyond the opening."""
+    fw, fh, fil = side_opening_frame_width, side_opening_frame_height, side_opening_frame_fillet
+    if side_opening_shape == "round":
+        opening = _ellipse_poly(0, z_c, w / 2.0, h / 2.0)
+        frame   = _ellipse_poly(0, z_c, w / 2.0 + fw, h / 2.0 + fh)
+    else:
+        opening = _rrect_poly(0, z_c, w, h, fil)
+        frame   = _rrect_poly(0, z_c, w + 2 * fw, h + 2 * fh, fil)
+    return opening, frame
+
+
+def _warp_profile_to_cylinder(profile, r_in, r_out, theta_c):
+    """Map a 2D (u, z) profile to a curved radial prism on the cylinder:
+    u -> angle offset (about theta_c), extrusion -> radial thickness."""
+    m = extrude_polygon(profile, r_out - r_in)   # polygon in (u, z); extrude along +axis
+    V = m.vertices
+    u, z, t = V[:, 0], V[:, 1], V[:, 2]
+    r = r_in + t
+    theta = theta_c + u / R_out                  # constant-angle columns -> clean radial cut
+    m.vertices = np.column_stack([r * np.cos(theta), r * np.sin(theta), z])
+    return m
+
+
+def build_side_openings(pockets):
+    """Two vertical peek windows adjacent to pocket 1's boss edges, each with a
+    raised bezel frame. Returns (opening_cutters, bezels, specs); each spec =
+    (theta_c, u_half_frame, z_bot_frame, z_top_frame) masks the wall pattern so
+    it stays clear of the bezel footprint."""
+    if not side_openings_enabled or not pockets:
+        return [], [], []
+    p1 = pockets[0]
+    p2 = pockets[1] if len(pockets) > 1 else None
+    ha1 = (p1.boss_arc_width / R_out) / 2.0
+    theta1 = p1.theta
+    if p2 is not None:
+        theta2 = p2.theta
+        ha2 = (p2.boss_arc_width / R_out) / 2.0
+    else:
+        theta2 = theta1 + math.pi   # virtual far boundary
+        ha2 = 0.0
+
+    fw, fh = side_opening_frame_width, side_opening_frame_height
+    relief = side_opening_frame_relief
+
+    # vertical band: frame (opening + top/bottom bands) must fit within clearances
+    band_lo = side_opening_bottom_clear
+    band_hi = sleeve_height - side_opening_top_clear
+    avail   = band_hi - band_lo
+    h = min(side_opening_height, avail - 2 * fh)
+    if h <= 0:
+        print("  ! side openings skipped: no vertical room", file=sys.stderr)
+        return [], [], []
+    frame_h = h + 2 * fh
+    z_frame_bot = band_lo + (avail - frame_h) / 2.0
+    z_bot = z_frame_bot + fh           # opening bottom
+    z_top = z_bot + h                  # opening top
+    z_c   = (z_bot + z_top) / 2.0
+
+    opening_cutters, bezels, specs = [], [], []
+    for s in (+1, -1):
+        # angular gap between p1's near edge and p2's near edge on this side
+        edge1 = theta1 + s * ha1
+        edge2 = theta2 - s * ha2
+        gap_arc = abs(edge2 - edge1) * R_out
+        # opening + both frame bands + a pocket_gap clearance at each end
+        max_w = gap_arc - 2 * side_opening_pocket_gap - 2 * fw
+        w = min(side_opening_width, max_w)
+        if w <= 0:
+            print(f"  ! side opening (s={s}) skipped: no room (gap_arc={gap_arc:.1f})",
+                  file=sys.stderr)
+            continue
+        # place frame near-edge a pocket_gap away from pocket 1's boss edge
+        theta_c = theta1 + s * (ha1 + (side_opening_pocket_gap + fw + w / 2.0) / R_out)
+
+        opening_poly, frame_poly = _opening_and_frame_profiles(w, h, z_c)
+        # raised bezel: frame slab from just inside the wall out to R_out + relief
+        bezels.append(_warp_profile_to_cylinder(frame_poly, R_out - 0.6,
+                                                R_out + relief, theta_c))
+        # through-cut: pierces wall + bezel
+        opening_cutters.append(_warp_profile_to_cylinder(opening_poly, R_in - 1.0,
+                                                         R_out + relief + 1.0, theta_c))
+        specs.append((theta_c, w / 2.0 + fw + 1.0,
+                      z_bot - fh - 1.0, z_top + fh + 1.0))
+    return opening_cutters, bezels, specs
+
+
+def mask_opening_regions(polygons, circumference, specs):
+    """Drop pattern holes overlapping a side-opening frame rect so the opening
+    keeps a clean solid border (no undercut by adjacent holes)."""
+    def overlaps(poly, spec):
+        theta_c, u_half, z_lo, z_hi = spec
+        pminx, pminy, pmaxx, pmaxy = poly.bounds
+        if pmaxy < z_lo or pminy > z_hi:
+            return False
+        u_c = theta_c * R_out
+        for shift in (-circumference, 0.0, circumference):
+            a, b = pminx + shift, pmaxx + shift
+            if not (b < u_c - u_half or a > u_c + u_half):
+                return True
+        return False
+    return [pg for pg in polygons if not any(overlaps(pg, sp) for sp in specs)]
+
+
+# ----------------------------------------------------------
+# Output naming + metadata
+# ----------------------------------------------------------
+def collect_params():
+    """Snapshot all module-level scalar parameters into a plain dict."""
+    out = {}
+    for k, v in globals().items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            out[k] = v
+    return out
+
+
+def next_model_paths(out_dir):
+    models_dir = os.path.normpath(os.path.join(out_dir, "..", "models"))
+    meta_dir = os.path.join(models_dir, "metadata")
+    os.makedirs(meta_dir, exist_ok=True)
+    existing = [f for f in os.listdir(models_dir)
+                if f.endswith(".stl") and base_name in f]
+    ID = len(existing) + 1
+    name = f"v{ID}_{base_name}_{inner_diameter:g}d_{sleeve_height:g}h"
+    return (os.path.join(models_dir, name + ".stl"),
+            os.path.join(meta_dir, name + ".yaml"))
+
+
+# ----------------------------------------------------------
 # Main build
 # ----------------------------------------------------------
 def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
 
-    print("[1/9] Cup body (closed bottom)...")
+    print("[1/10] Cup body (closed bottom)...")
     sleeve = build_cup()
 
     if base_border_enabled:
-        print("[2/9] Base border ring...")
+        print("[2/10] Base border ring...")
         border = build_base_border()
         if border is not None:
             sleeve = trimesh.boolean.union([sleeve, border], engine=ENGINE)
@@ -360,32 +553,45 @@ def main():
     if pocket2_enabled: pockets.append(make_pocket2())
 
     if pockets:
-        print(f"[3/9] Union {len(pockets)} pocket boss(es)...")
+        print(f"[3/10] Union {len(pockets)} pocket boss(es)...")
         sleeve = trimesh.boolean.union([sleeve] + [p.boss() for p in pockets], engine=ENGINE)
-        print("[4/9] Subtract pocket cavities...")
+        print("[4/10] Subtract pocket cavities...")
         sleeve = trimesh.boolean.difference([sleeve] + [p.cavity() for p in pockets], engine=ENGINE)
-        print("[5/9] Subtract pocket windows...")
+        print("[5/10] Subtract pocket windows...")
         sleeve = trimesh.boolean.difference([sleeve] + [p.window() for p in pockets], engine=ENGINE)
 
-    print("[6/9] Wall pattern...")
+    print("[6/10] Side openings...")
+    side_cutters, side_bezels, opening_specs = build_side_openings(pockets)
+    print(f"      {len(side_cutters)} opening(s), {len(side_bezels)} bezel(s)")
+
+    print("[7/10] Wall pattern...")
     polys, circumference = generate_pattern_polygons()
     print(f"      generated {len(polys)} candidate polygons")
     polys = mask_pocket_regions(polys, circumference, pockets)
     print(f"      {len(polys)} after pocket mask")
+    polys = mask_opening_regions(polys, circumference, opening_specs)
+    print(f"      {len(polys)} after opening mask")
     max_boss_R = max((p.boss_R_out for p in pockets), default=R_out)
     cutters = build_pattern_cutters(polys, max_boss_R)
     print(f"      {len(cutters)} 3D cutters")
     if cutters:
-        print("[7/9] Subtract wall pattern...")
+        print("[8/10] Subtract wall pattern...")
         sleeve = trimesh.boolean.difference([sleeve] + cutters, engine=ENGINE)
 
+    if side_bezels:
+        print("      Union side-opening bezels...")
+        sleeve = trimesh.boolean.union([sleeve] + side_bezels, engine=ENGINE)
+    if side_cutters:
+        print("      Subtract side openings...")
+        sleeve = trimesh.boolean.difference([sleeve] + side_cutters, engine=ENGINE)
+
     bottom_cutters = build_bottom_pattern_cutters()
-    print(f"[8/9] Bottom floor pattern ({len(bottom_cutters)} holes)...")
+    print(f"[9/10] Bottom floor pattern ({len(bottom_cutters)} holes)...")
     if bottom_cutters:
         sleeve = trimesh.boolean.difference([sleeve] + bottom_cutters, engine=ENGINE)
 
     sleeve.process(validate=True)
-    print(f"[9/9] is_watertight={sleeve.is_watertight}  "
+    print(f"[10/10] is_watertight={sleeve.is_watertight}  "
           f"verts={len(sleeve.vertices)}  faces={len(sleeve.faces)}  "
           f"volume={sleeve.volume:.1f} mm^3")
     # if not sleeve.is_watertight:
@@ -394,9 +600,12 @@ def main():
     #     sleeve.process(validate=True)
     #     print(f"    after repair: is_watertight={sleeve.is_watertight}")
 
-    stl_path = os.path.join(out_dir, "coffee_sleeve.stl")
+    stl_path, yaml_path = next_model_paths(out_dir)
     sleeve.export(stl_path)
     print(f"Wrote {stl_path}")
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(collect_params(), f, sort_keys=False)
+    print(f"Wrote {yaml_path}")
 
     png_path = os.path.join(out_dir, "coffee_sleeve_preview.png")
     render_preview(sleeve, png_path)
