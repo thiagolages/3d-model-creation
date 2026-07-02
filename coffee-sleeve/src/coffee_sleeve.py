@@ -28,7 +28,7 @@ from shapely.geometry import Polygon, Point, box
 
 # --- Cylinder body ---
 inner_diameter          = 105.25
-sleeve_height           = 108.0
+sleeve_height           = 108.0 # Define short, medium, tall here
 wall_thickness          = 2.0
 bottom_thickness        = 2.0     # mm, thickness of the closed floor
 
