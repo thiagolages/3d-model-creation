@@ -25,14 +25,27 @@ from shapely.geometry import Polygon, Point, box
 # PARAMETERS - edit these to customize
 # ============================================================
 
-# --- Output naming ---
-base_name               = "coffee_sleeve_official"
 
 # --- Cylinder body ---
 inner_diameter          = 105.25
 sleeve_height           = 108.0
 wall_thickness          = 2.0
 bottom_thickness        = 2.0     # mm, thickness of the closed floor
+
+# --- Model Type (short/medium/tall) ---
+if sleeve_height < 50.0:
+    raise ValueError(f"sleeve_height={sleeve_height} is too short (<50mm)")
+elif sleeve_height < 90:
+    model_type = "short"
+elif sleeve_height < 115:
+    model_type = "medium"
+elif sleeve_height < 155:
+    model_type = "tall"
+else:
+    raise ValueError(f"sleeve_height={sleeve_height} is too tall (>155mm)")
+
+# --- Output naming ---
+base_name               = "coffee_sleeve_" + model_type
 
 # --- Paper (shared by both pockets) ---
 paper_thickness         = 0.25
@@ -41,10 +54,10 @@ paper_pocket_clearance  = 0.2
 # --- Pocket 1: main, +X side, runs near floor to top ---
 pocket1_enabled         = True
 pocket1_theta_deg       = 0.0
-pocket1_paper_width     = 93.0
+pocket1_paper_width     = 95.0
 pocket1_paper_height    = None    # None = auto from floor margin to top
 pocket1_back_wall       = 1.2    # ≥2 FDM perimeters
-pocket1_frame_side      = 10.0     # frame margin left/right of window
+pocket1_frame_side      = 8.0     # frame margin left/right of window
 pocket1_frame_bottom    = 3.0     # frame margin below window
 pocket1_bottom_clearance = 2.0    # gap between paper bottom and sleeve floor
 
@@ -55,15 +68,15 @@ pocket2_paper_width     = pocket1_paper_width # same as paper1
 pocket2_frame_bottom    = 3.0
 pocket2_paper_height    = 35.0 + pocket2_frame_bottom  # height from the top
 pocket2_back_wall       = 1.2    # ≥2 FDM perimeters
-pocket2_frame_side      = 10.0
+pocket2_frame_side      = 8.0
 
 # --- Hole pattern on the cylinder wall ---
 pattern_shape           = "hexagon"   # hexagon | pentagon | triangle
 pattern_size            = 10.0
 pattern_spacing         = 1.5
 pattern_margin_top      = 1.5
-pattern_margin_bottom   = 4.0
-pattern_through_pockets = True   # let the wall pattern cut through pockets 1 & 2
+pattern_margin_bottom   = 8.0
+pattern_through_pockets = False   # let the wall pattern cut through pockets 1 & 2
 
 # --- Side openings: two vertical peek windows flanking pocket 1 ---
 side_openings_enabled     = True
@@ -74,9 +87,9 @@ side_opening_bottom_clear = 8.0    # gap from sleeve bottom
 side_opening_pocket_gap   = 2.0    # clearance from pocket 1 boss edge
 # Opening + raised bezel frame
 side_opening_shape         = "rectangular"  # rectangular | round (ellipse)
-side_opening_frame_width   = 0.0   # bezel band thickness L/R (arc), beyond opening
-side_opening_frame_height  = 0.0   # bezel band thickness top/bottom (z), beyond opening
-side_opening_frame_relief  = 0.0   # radial protrusion of the raised bezel
+side_opening_frame_width   = 2.0   # bezel band thickness L/R (arc), beyond opening
+side_opening_frame_height  = 2.0   # bezel band thickness top/bottom (z), beyond opening
+side_opening_frame_relief  = 1.0   # radial protrusion of the raised bezel
 side_opening_frame_fillet  = 8.0   # corner radius (rectangular only)
 
 # --- Bottom floor pattern ---
@@ -523,14 +536,21 @@ def collect_params():
 
 def next_model_paths(out_dir):
     models_dir = os.path.normpath(os.path.join(out_dir, "..", "models"))
+    models_dir = os.path.join(models_dir, model_type) # short/medium/tall
+
+    print(f"  next_model_paths: models_dir={models_dir}")
+
     meta_dir = os.path.join(models_dir, "metadata")
+    img_dir = os.path.join(models_dir, "images")
     os.makedirs(meta_dir, exist_ok=True)
+    os.makedirs(img_dir, exist_ok=True)
     existing = [f for f in os.listdir(models_dir)
                 if f.endswith(".stl") and base_name in f]
     ID = len(existing) + 1
     name = f"v{ID}_{base_name}_{inner_diameter:g}d_{sleeve_height:g}h"
     return (os.path.join(models_dir, name + ".stl"),
-            os.path.join(meta_dir, name + ".yaml"))
+            os.path.join(meta_dir, name + ".yaml"),
+            os.path.join(img_dir, name + ".png"))
 
 
 # ----------------------------------------------------------
@@ -594,21 +614,21 @@ def main():
     print(f"[10/10] is_watertight={sleeve.is_watertight}  "
           f"verts={len(sleeve.vertices)}  faces={len(sleeve.faces)}  "
           f"volume={sleeve.volume:.1f} mm^3")
-    # if not sleeve.is_watertight:
-    #     print("  ! not watertight, attempting fill_holes ...")
-    #     sleeve.fill_holes()
-    #     sleeve.process(validate=True)
-    #     print(f"    after repair: is_watertight={sleeve.is_watertight}")
 
-    stl_path, yaml_path = next_model_paths(out_dir)
+    # Save outputs: STL, YAML metadata, PNG preview
+
+    stl_path, yaml_path, png_path = next_model_paths(out_dir)
+    
     sleeve.export(stl_path)
     print(f"Wrote {stl_path}")
+    
     with open(yaml_path, "w") as f:
         yaml.safe_dump(collect_params(), f, sort_keys=False)
     print(f"Wrote {yaml_path}")
 
-    png_path = os.path.join(out_dir, "coffee_sleeve_preview.png")
     render_preview(sleeve, png_path)
+    # Will print 'wrote' inside render_preview() if successful
+    
     return sleeve
 
 
